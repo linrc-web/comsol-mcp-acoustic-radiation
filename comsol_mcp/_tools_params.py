@@ -30,6 +30,49 @@ def get_parameters() -> str:
     return _run_tool_readonly("get_parameters", _impl)
 
 
+def evaluate_parameter(parameter_name: str) -> str:
+    """Read one global parameter through Java param().evaluate(name) only.
+
+    No result/numerical nodes, datasets, setters, builds or solves are used.
+    Unit comes directly from param().evaluateUnit(name); if unavailable it is
+    null with a unit_error. Evaluation errors are returned without fallback.
+    """
+
+    def _impl() -> dict[str, Any]:
+        if not isinstance(parameter_name, str) or not parameter_name.strip():
+            raise ValueError("parameter_name must be a non-empty string.")
+        model = _require_visible_main("evaluate_parameter")
+        row: dict[str, Any] = {
+            "parameter_name": parameter_name,
+            "value": None,
+            "unit": None,
+            "getter": "param().evaluate",
+            "unit_getter": "param().evaluateUnit",
+            "available": False,
+            "error": None,
+            "unit_error": None,
+        }
+        try:
+            parameters = model.java.param()
+            row["value"] = float(parameters.evaluate(parameter_name))
+        except Exception as exc:
+            row["error"] = str(exc)
+            return row
+
+        row["available"] = True
+        try:
+            unit = parameters.evaluateUnit(parameter_name)
+            if unit is None:
+                row["unit_error"] = "param().evaluateUnit returned null; unit unavailable."
+            else:
+                row["unit"] = str(unit)
+        except Exception as exc:
+            row["unit_error"] = str(exc)
+        return row
+
+    return _run_tool_readonly("evaluate_parameter", _impl)
+
+
 def evaluate_expressions(expressions_json: str = "[]", max_result_size: int = 0) -> str:
     """Evaluate one or more expressions on the current server-side model.
 
@@ -170,6 +213,7 @@ def set_parameters(parameters_json: str) -> str:
 
 def register(mcp_instance) -> None:
     mcp_instance.add_tool(get_parameters)
+    mcp_instance.add_tool(evaluate_parameter)
     mcp_instance.add_tool(evaluate_expressions)
     mcp_instance.add_tool(get_core_metrics)
     mcp_instance.add_tool(set_parameters)

@@ -107,3 +107,43 @@ def _add_segregated_step(
     if variables:
         step.set("segvar", variables)
     return {"step_tag": step_tag, "variables": variables, "created": True}
+
+
+# Study configuration helpers (never build meshes or run solvers).
+def _create_study(model: Any, study_tag: str) -> dict[str, Any]:
+    studies = model.java.study()
+    if study_tag in list(studies.tags()):
+        return {"study_tag": study_tag, "created": False}
+    studies.create(study_tag)
+    return {"study_tag": study_tag, "created": True}
+
+
+def _require_study(model: Any, study_tag: str) -> Any:
+    if study_tag not in list(model.java.study().tags()):
+        raise ValueError(f'Study "{study_tag}" does not exist.')
+    return model.java.study(study_tag)
+
+
+def _require_frequency_step(study: Any, step_tag: str) -> Any:
+    if step_tag not in list(study.feature().tags()):
+        raise ValueError(f'Study step "{step_tag}" does not exist.')
+    step = study.feature(step_tag)
+    if str(step.type()) != "Frequency":
+        raise ValueError(f'Study step "{step_tag}" is not a Frequency step.')
+    return step
+
+
+def _create_frequency_domain_step(model: Any, study_tag: str, step_tag: str) -> dict[str, Any]:
+    study = _require_study(model, study_tag)
+    created = step_tag not in list(study.feature().tags())
+    if created:
+        study.create(step_tag, "Frequency")
+    else:
+        _require_frequency_step(study, step_tag)
+    return {"study_tag": study_tag, "step_tag": step_tag, "created": created}
+
+
+def _set_study_frequency(model: Any, study_tag: str, step_tag: str, frequency: str) -> dict[str, Any]:
+    step = _require_frequency_step(_require_study(model, study_tag), step_tag)
+    step.set("plist", frequency)
+    return {"study_tag": study_tag, "step_tag": step_tag, "frequency": frequency}

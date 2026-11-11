@@ -4,46 +4,61 @@
 from __future__ import annotations
 
 import concurrent.futures
-import logging
 from typing import Any
+
+from comsol_mcp._diagnostics import phase
 
 from comsol_mcp._server import _get_mph
 import comsol_mcp._server as _srv
+from comsol_mcp._dispatch import checkpoint, current_job, get_worker
 
 
 def _timed_call(func, *args, timeout: float = 30.0, error_msg=""):
-    """Call a potentially slow function with a hard timeout.
+    """Run on the same MPH worker; a deadline never terminates a Java call.
 
-    The key difference from ``with ThreadPoolExecutor``: uses
-    ``shutdown(wait=False)`` so that a hung Java call never blocks
-    the caller.  The worker thread is a daemon and will not prevent
-    process exit.
+    Nested calls lend their deadline to the asynchronous MCP waiter. Legacy
+    background callers wait on that worker instead of creating another thread.
     """
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    runtime = get_worker()
+    parent = current_job()
+    if parent is not None:
+        import time
+        with runtime.lock:
+            previous = parent.deadline
+            deadline = time.monotonic() + timeout
+            parent.deadline = deadline if previous is None else min(previous, deadline)
+        try:
+            checkpoint(getattr(func, "__name__", "java_call"))
+            result = func(*args)
+            checkpoint("java_call_returned")
+            return result
+        finally:
+            with runtime.lock:
+                parent.deadline = previous
+    job = runtime.submit(getattr(func, "__name__", "java_call"), lambda: func(*args), timeout)
     try:
-        future = executor.submit(func, *args)
-        return future.result(timeout=timeout)
+        return job.future.result(timeout=timeout)
     except concurrent.futures.TimeoutError:
-        raise RuntimeError(
-            error_msg
-            or f"Operation timed out after {timeout}s"
-        )
-    finally:
-        executor.shutdown(wait=False)
+        runtime.expire(job)
+        raise RuntimeError(error_msg or f"Operation timed out after {timeout}s; underlying call may still be running.")
 
 
 def _disconnect_locked(*, shutdown_server: bool = False) -> None:
-    if _srv._client is not None:
+    if _srv._client is not None and (_srv._client_connected or _srv._client_connection_uncertain):
         try:
-            _timed_call(_srv._client.disconnect, timeout=15.0)
+            checkpoint("disconnect")
+            _srv._client.disconnect()
+            _srv._client_connection_uncertain = False
         except Exception as exc:
             if "not connected" not in str(exc).lower():
                 _srv._last_error = f"Disconnect failed: {exc}"
+                _srv._client_connection_uncertain = True
+                raise
+            _srv._client_connection_uncertain = False
         finally:
             _srv._client_connected = False
             _srv._connected_host = ""
             _srv._connected_port = None
-            _srv._client = None
 
     _srv._current_model = None
     _srv._current_model_origin = ""
@@ -62,16 +77,31 @@ def _disconnect_locked(*, shutdown_server: bool = False) -> None:
         _srv._server_started_by_mcp = False
 
 
-def _ensure_client_shell() -> Any:
+def _ensure_client_shell(version: str | None = None) -> Any:
+    requested_version = version or _srv.DEFAULT_VERSION
+    if _srv._client is not None and requested_version and _srv._client.version != requested_version:
+        raise RuntimeError("The JVM is already initialized for a different COMSOL version; restart MCP to change versions.")
     if _srv._client is None:
+        checkpoint("import")
         mph = _get_mph()
         if mph is None:
             raise RuntimeError("MPh is not available; cannot create client shell.")
-        _srv._client = mph.Client(host=None)
+        if _srv._client_initialization_attempted:
+            raise RuntimeError("Client initialization previously failed; restart the MCP process before retrying.")
+        checkpoint("initialize")
+        _srv._client_initialization_attempted = True
+        with phase("jvm_initialization"):
+            _srv._client = mph.Client(version=requested_version, host=None)
+        checkpoint("initialized")
     return _srv._client
 
 
 def _require_client() -> Any:
+    runtime = _srv._connection_worker
+    if runtime is not None:
+        with runtime.lock:
+            if any(job.expired for job in runtime.pending):
+                raise RuntimeError("A timed-out operation is still pending; client state is unconfirmed.")
     if _srv._client is None or not _srv._client_connected:
         raise RuntimeError("Not connected to a COMSOL Multiphysics Server.")
     return _srv._client

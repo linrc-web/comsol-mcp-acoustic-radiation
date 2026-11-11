@@ -11,6 +11,55 @@ from comsol_mcp._model_ops import _normalize_properties, _apply_feature_properti
 # ---------------------------------------------------------------------------
 # Physics interface helpers
 # ---------------------------------------------------------------------------
+def _get_physics_selection(
+    model: Any, component: str, physics_tag: str, feature_tag: str | None = None,
+) -> dict[str, Any]:
+    """Read documented COMSOL 6.4 selection getters; never initialize selections.
+
+    Selection/LocalSelection/XDLocalSelection do not document isAll().
+    all() is a setter; isGeom() means whole geometry, not the all-entities flag.
+    https://doc.comsol.com/6.4/doc/com.comsol.help.comsol/api/com/comsol/model/Selection.html
+    https://doc.comsol.com/6.4/doc/com.comsol.help.comsol/api/com/comsol/model/AbstractSelection.html
+    """
+    comp = model.java.component(component)
+    if physics_tag not in [str(tag) for tag in comp.physics().tags()]:
+        raise ValueError(f'Physics "{physics_tag}" does not exist.')
+    target = comp.physics(physics_tag)
+    if feature_tag is not None:
+        if feature_tag not in [str(tag) for tag in target.feature().tags()]:
+            raise ValueError(f'Physics feature "{feature_tag}" does not exist.')
+        target = target.feature(feature_tag)
+    selection = target.selection()
+    unavailable = {
+        "selection_all": "COMSOL 6.4 documents no all-entities flag getter; "
+                         "all() mutates and isGeom() is not equivalent."
+    }
+    result: dict[str, Any] = {
+        "component": component, "physics_tag": physics_tag,
+        "scope": "physics" if feature_tag is None else "feature",
+        "feature_tag": feature_tag, "selection_all": None,
+        "geometry_dimension": None, "entity_ids": None,
+        "unavailable": unavailable,
+    }
+    for field, method_name, convert in (
+        ("geometry_dimension", "dim", int),
+        ("entity_ids", "entities", lambda values: [int(v) for v in values]),
+    ):
+        # Only missing bindings are unavailable. Getter exceptions propagate;
+        # do not retry, use alternative APIs, or modify selection to recover.
+        try:
+            getter = getattr(selection, method_name)
+        except AttributeError:
+            unavailable[field] = f"{method_name}() getter unavailable."
+            continue
+        value = getter()
+        if value is None:
+            unavailable[field] = f"{method_name}() returned null."
+        else:
+            result[field] = convert(value)
+    return result
+
+
 def _list_physics(model: Any, component: str) -> list[dict[str, Any]]:
     comp = model.java.component(component)
     tags = list(comp.physics().tags())
@@ -71,7 +120,12 @@ def _list_physics_features(model: Any, component: str, physics_tag: str) -> list
 
 
 def _auto_detect_dimension(model: Any, component: str) -> int:
-    """Detect spatial dimension. Priority: workflow config > existing physics > 0."""
+    """Prefer actual geometry dimensions, then workflow and physics fallbacks."""
+    comp = model.java.component(component)
+    for geom_tag in comp.geom().tags():
+        dim = _geometry_dimension(comp.geom(geom_tag))
+        if dim:
+            return dim
     # 1. Check workflow state
     try:
         from comsol_mcp._state import _read_workflow_state
@@ -124,6 +178,19 @@ def _auto_detect_dimension(model: Any, component: str) -> int:
     return 0
 
 
+def _geometry_dimension(geom: Any) -> int:
+    """Read geometry dimensions without building or changing the geometry."""
+    for name in ("getSDim", "dimension", "getDimension", "dim", "spatialDim"):
+        try:
+            value = getattr(geom, name)
+            dim = int(value() if callable(value) else value)
+            if dim in (1, 2, 3):
+                return dim
+        except Exception:
+            continue
+    return 0
+
+
 def _java_int(value: int):
     """Convert Python int to Java int for COMSOL API overload resolution."""
     try:
@@ -133,8 +200,16 @@ def _java_int(value: int):
         return value
 
 
-def _create_physics(model: Any, component: str, tag: str, physics_type: str, dimension: int = 0, dependent_variables: str = "u") -> dict[str, Any]:
+def _create_physics(model: Any, component: str, tag: str, physics_type: str, dimension: int = 0, dependent_variables: str = "u", geometry_tag: str | None = None) -> dict[str, Any]:
+    if component not in [str(t) for t in model.java.component().tags()]:
+        raise ValueError(f'Component "{component}" does not exist.')
     comp = model.java.component(component)
+    geom_tags = [str(t) for t in comp.geom().tags()]
+    if geometry_tag is not None and not isinstance(geometry_tag, str):
+        raise ValueError("geometry_tag must be a string or None.")
+    requested_geometry = geometry_tag.strip() if geometry_tag is not None else ""
+    if requested_geometry and requested_geometry not in geom_tags:
+        raise ValueError(f'Geometry "{requested_geometry}" does not exist under component "{component}".')
     existing = list(comp.physics().tags())
     if tag in existing:
         return {"tag": tag, "physics_type": physics_type, "created": False, "message": "Physics already exists."}
@@ -142,14 +217,21 @@ def _create_physics(model: Any, component: str, tag: str, physics_type: str, dim
     if dim <= 0:
         dim = _auto_detect_dimension(model, component)
 
-    if dim > 0:
-        # mph Java bridge has no (String, String, int) overload.
-        # Use (String, String, String[]) overload with dependent variable names.
-        # COMSOL automatically matches spatial dimension from the component's geometry.
+    if requested_geometry:
+        comp.physics().create(tag, physics_type, requested_geometry)
+        dim = _geometry_dimension(comp.geom(requested_geometry))
+    elif geom_tags:
+        if len(geom_tags) != 1:
+            raise ValueError("Multiple geometries exist; supply geometry_tag explicitly. No physics was created.")
+        # A unique geometry establishes association even if dimension getters fail.
+        geometry_tag = geom_tags[0]
+        dim = _geometry_dimension(comp.geom(geometry_tag)) or dim
         dep_vars = [v.strip() for v in dependent_variables.split(",") if v.strip()]
         if not dep_vars:
             dep_vars = ["u"]
-        comp.physics().create(tag, physics_type, dep_vars)
+        comp.physics().create(tag, physics_type, geometry_tag, dep_vars)
+    elif dim > 0 or physics_type == "PressureAcoustics":
+        raise ValueError("Spatial physics requires an existing geometry; no 0D fallback was attempted.")
     else:
         comp.physics().create(tag, physics_type)
     return {"tag": tag, "physics_type": physics_type, "dimension": dim, "created": True}
@@ -166,13 +248,18 @@ def _remove_physics(model: Any, component: str, tag: str) -> dict[str, Any]:
 
 def _create_physics_feature(
     model: Any, component: str, physics_tag: str,
-    feature_tag: str, feature_type: str,
+    feature_tag: str, feature_type: str, dimension: int | None = None,
 ) -> dict[str, Any]:
+    if dimension is not None and (type(dimension) is not int or not 0 <= dimension <= 3):
+        raise ValueError("dimension must be an integer between 0 and 3, or None.")
     phys = model.java.component(component).physics(physics_tag)
     existing = list(phys.feature().tags())
     if feature_tag in existing:
         return {"tag": feature_tag, "feature_type": feature_type, "created": False, "message": "Feature already exists."}
-    phys.feature().create(feature_tag, feature_type)
+    if dimension is None:
+        phys.feature().create(feature_tag, feature_type)
+    else:
+        phys.feature().create(feature_tag, feature_type, _java_int(dimension))
     return {"tag": feature_tag, "feature_type": feature_type, "created": True}
 
 

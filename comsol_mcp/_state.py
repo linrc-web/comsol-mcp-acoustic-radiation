@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from comsol_mcp._diagnostics import phase
+
 import json
 import logging
 import os
@@ -22,6 +24,7 @@ from comsol_mcp._server import (
     _get_mph, _get_mph_error,
 )
 import comsol_mcp._server as _srv
+from comsol_mcp._dispatch import checkpoint, current_job, failure_result, remaining
 
 
 # ---------------------------------------------------------------------------
@@ -439,8 +442,9 @@ def _run_tool_readonly(tool: str, callback) -> str:
 
     Use for tools that only read state and never modify the model or
     connection (server_info, check_server_port, workflow_info, run_study_status).
-    These tools must remain responsive even when a long-running operation
-    (e.g., run_study_async) holds the lock.
+    The MCP registration adapter runs this on the dedicated worker. During a
+    timed-out connection it returns an unconfirmed busy snapshot at dispatch,
+    rather than reading the live client concurrently.
     """
     _setup_logging()
     try:
@@ -452,9 +456,15 @@ def _run_tool_readonly(tool: str, callback) -> str:
 
 
 def _run_tool(tool: str, callback) -> str:
+    job = current_job()
+    if job is not None:
+        checkpoint("lock")
     _setup_logging()
-    acquired = _runtime_lock.acquire(timeout=120.0)
+    with phase("model_lock_acquire"):
+        acquired = _runtime_lock.acquire(timeout=remaining(120.0))
     if not acquired:
+        if job is not None:
+            return failure_result(tool, "Runtime lock acquisition timed out", stage="lock", job=job)
         err_msg = (
             f"Tool {tool} could not acquire the runtime lock within 120s. "
             "Another tool is likely running a long operation (e.g., model.solve). "
@@ -465,9 +475,12 @@ def _run_tool(tool: str, callback) -> str:
     try:
         try:
             data = callback()
+            checkpoint("result")
             return _tool_result(tool, True, data=data)
         except Exception as exc:
             logging.exception("Tool %s failed", tool)
+            if job is not None:
+                return failure_result(tool, exc, stage=job.stage, job=job)
             return _tool_result(tool, False, error=str(exc))
     finally:
         _runtime_lock.release()

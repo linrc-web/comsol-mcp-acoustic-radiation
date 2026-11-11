@@ -28,3 +28,7 @@ Thumbs.db
 .idea/
 .vscode/
 .claude/
+
+# Local debug/export data
+comp1_p_all_dofs.json
+dof_field_sol1_comp1_p_100.json

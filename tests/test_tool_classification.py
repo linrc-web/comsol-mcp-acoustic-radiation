@@ -20,3 +20,14 @@ def test_all_classified_tools_are_registered():
     registered = set(mcp._tool_manager._tools.keys())
     classified = SAFE_READ_TOOLS | SAFE_VISIBLE_MAIN_WRITE_TOOLS | RESTRICTED_TOOLS
     assert classified.issubset(registered), f"Classified but not registered: {classified - registered}"
+
+
+def test_study_tools_are_protected_writes():
+    names = {"create_study", "create_frequency_domain_step", "set_study_frequency"}
+    assert names <= SAFE_VISIBLE_MAIN_WRITE_TOOLS
+
+
+def test_geometry_selection_tools_classification():
+    assert "get_geometry_feature_properties" in SAFE_READ_TOOLS
+    assert "get_geometry_feature_selection" in SAFE_READ_TOOLS
+    assert "set_geometry_feature_selection" in SAFE_VISIBLE_MAIN_WRITE_TOOLS

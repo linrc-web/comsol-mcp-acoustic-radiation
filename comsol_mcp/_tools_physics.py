@@ -8,13 +8,70 @@ from typing import Any
 
 from comsol_mcp._state import _run_tool, _run_tool_readonly, _safe_model_label
 from comsol_mcp._model import _require_visible_main
+from comsol_mcp._model_ops import _read_feature_property_values
 from comsol_mcp._physics_ops import (
+    _get_physics_selection,
     _list_physics, _list_physics_features,
     _create_physics, _remove_physics,
     _create_physics_feature, _remove_physics_feature,
     _apply_physics_properties, _set_physics_selection,
     _list_variables, _create_variable, _remove_variable,
 )
+
+
+def get_physics_feature_property_values(
+    component: str, physics_tag: str, feature_tag: str, property_names: list[str],
+) -> str:
+    """Strict read-only typed property values, in requested order; no evaluation.
+
+    Uses hasProperty/getValueType and one documented COMSOL 6.4 typed getter
+    per property, without probes or fallback. Unreadable properties return
+    available=false and an error independently. Strings remain verbatim.
+    Empty requests still validate the existing component/physics/feature.
+    """
+    def _impl() -> dict[str, Any]:
+        tags = dict(component=component, physics_tag=physics_tag, feature_tag=feature_tag)
+        for name, value in tags.items():
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{name} is required.")
+        tags = {name: value.strip() for name, value in tags.items()}
+        model = _require_visible_main("get_physics_feature_property_values")
+        if tags["component"] not in [str(t) for t in model.java.component().tags()]:
+            raise LookupError(f'Component "{tags["component"]}" does not exist.')
+        comp = model.java.component(tags["component"])
+        if tags["physics_tag"] not in [str(t) for t in comp.physics().tags()]:
+            raise LookupError(f'Physics "{tags["physics_tag"]}" does not exist.')
+        physics = comp.physics(tags["physics_tag"])
+        if tags["feature_tag"] not in [str(t) for t in physics.feature().tags()]:
+            raise LookupError(f'Physics feature "{tags["feature_tag"]}" does not exist.')
+        feature = physics.feature(tags["feature_tag"])
+        return {**tags, "properties": _read_feature_property_values(feature, property_names)}
+
+    return _run_tool_readonly("get_physics_feature_property_values", _impl)
+
+
+def get_physics_selection(
+    component: str, physics_tag: str, feature_tag: str | None = None,
+) -> str:
+    """Read interface (None) or feature selection using dim() and entities().
+
+    selection_all is null: COMSOL 6.4 has no documented all-flag getter.
+    IDs retain API order; null IDs mean unavailable, [] means an empty result.
+    Missing getter bindings return unavailable reasons; getter errors fail
+    without retry. Never changes selections or builds geometry.
+    """
+    def _impl() -> dict[str, Any]:
+        comp, phys = component.strip(), physics_tag.strip()
+        ftag = None if feature_tag is None else feature_tag.strip()
+        for name, value in (("component", comp), ("physics_tag", phys)):
+            if not value:
+                raise ValueError(f"{name} is required.")
+        if ftag == "":
+            raise ValueError("feature_tag must be nonempty or None.")
+        model = _require_visible_main("get_physics_selection")
+        return _get_physics_selection(model, comp, phys, ftag)
+
+    return _run_tool_readonly("get_physics_selection", _impl)
 
 
 def list_physics(component: str = "comp1") -> str:
@@ -37,7 +94,7 @@ def list_physics(component: str = "comp1") -> str:
     return _run_tool_readonly("list_physics", _impl)
 
 
-def create_physics(component: str, tag: str, physics_type: str, dimension: int = 0, dependent_variables: str = "u") -> str:
+def create_physics(component: str, tag: str, physics_type: str, dimension: int = 0, dependent_variables: str = "u", geometry_tag: str | None = None) -> str:
     """Add a physics interface to a component.
 
     Common physics_type values: "cfpde" (Coefficient Form PDE),
@@ -50,6 +107,11 @@ def create_physics(component: str, tag: str, physics_type: str, dimension: int =
     dependent_variables: comma-separated dependent variable names. Default "u".
     COMSOL uses these to create the correct physics with matching spatial dimension.
     For multiple dependent variables use "u,v" or "u,v,w".
+
+    geometry_tag: explicit existing geometry to bind using the three-argument
+    Java overload. If omitted/empty, a unique geometry is bound automatically,
+    preserving dependent_variables. Multiple geometries require an explicit tag.
+    Geometry dimensions take precedence over persisted workflow dimensions.
     """
 
     def _impl() -> dict[str, Any]:
@@ -63,7 +125,7 @@ def create_physics(component: str, tag: str, physics_type: str, dimension: int =
             raise ValueError("Physics tag is required.")
         if not ptype:
             raise ValueError("physics_type is required.")
-        result = _create_physics(model, comp, phys_tag, ptype, dim, dep_vars)
+        result = _create_physics(model, comp, phys_tag, ptype, dim, dep_vars, geometry_tag)
         return {"component": comp, **result}
 
     return _run_tool("create_physics", _impl)
@@ -116,8 +178,12 @@ def create_physics_feature(
     feature_tag: str,
     feature_type: str,
     properties_json: str = "[]",
+    dimension: int | None = None,
 ) -> str:
     """Add a child feature (boundary condition, source term, etc.) to a physics interface.
+
+    dimension: optional geometric entity dimension (0-3); 2 selects boundaries
+    in 3D. Omit to preserve the original two-argument Java creation call.
 
     IMPORTANT: feature_type uses COMSOL internal identifiers, NOT display names.
     For example, in TDS (Transport of Diluted Species), valid types include:
@@ -141,7 +207,10 @@ def create_physics_feature(
             raise ValueError("feature_tag is required.")
         if not ftype:
             raise ValueError("feature_type is required.")
-        result = _create_physics_feature(model, comp, phys, ftag, ftype)
+        if dimension is None:
+            result = _create_physics_feature(model, comp, phys, ftag, ftype)
+        else:
+            result = _create_physics_feature(model, comp, phys, ftag, ftype, dimension)
         applied = []
         if properties_json.strip() and properties_json.strip() != "[]":
             applied = _apply_physics_properties(model, comp, phys, ftag, properties_json)
@@ -294,6 +363,8 @@ def manage_variables(
 
 
 def register(mcp_instance) -> None:
+    mcp_instance.add_tool(get_physics_feature_property_values)
+    mcp_instance.add_tool(get_physics_selection)
     mcp_instance.add_tool(list_physics)
     mcp_instance.add_tool(create_physics)
     mcp_instance.add_tool(remove_physics)

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
+from comsol_mcp._diagnostics import phase
 
 # Lazy mph import: defer until first use so pip installs mid-session work.
 _mph: Any | None = None
@@ -22,7 +23,8 @@ def _get_mph():
     if _mph is not None:
         return _mph
     try:
-        import mph as _m
+        with phase("mph_import"):
+            import mph as _m
         _mph = _m
         _mph_import_error = ""
     except Exception as exc:  # pragma: no cover - handled at runtime
@@ -75,6 +77,10 @@ _server_started_by_mcp = False
 _last_command = ""
 _last_error = ""
 _logger_ready = False
+_connection_worker: Any | None = None
+_connection_worker_lock = threading.RLock()
+_client_initialization_attempted = False
+_client_connection_uncertain = False
 _background_jobs: dict[str, dict[str, Any]] = {}
 _background_jobs_lock = threading.RLock()
 
@@ -93,6 +99,22 @@ RECOMMENDED_DESKTOP_FLOW = (
 # Tool classification sets (for visible-main guard)
 # ---------------------------------------------------------------------------
 SAFE_READ_TOOLS = {
+    "evaluate_parameter",
+    "get_physics_feature_property_values",
+    "get_mesh_feature_property_values",
+    "get_mesh_feature_active",
+    "list_mesh_features",
+    "get_mesh_feature_properties",
+    "get_mesh_feature_selection",
+    "get_physics_selection",
+    "get_geometry_boundary_info",
+    "get_geometry_topology_info",
+    "get_geometry_feature_object_names",
+    "list_geometry_feature_properties",
+    "get_geometry_feature_properties",
+    "get_geometry_feature_selection",
+    "read_solution_dof_field",
+    "inspect_solution",
     "server_info",
     "check_server_port",
     "workflow_info",
@@ -107,6 +129,17 @@ SAFE_READ_TOOLS = {
     "run_study_status",
 }
 SAFE_VISIBLE_MAIN_WRITE_TOOLS = {
+    "evaluate_solution_points",
+    "move_mesh_feature",
+    "create_mesh_feature",
+    "update_mesh_feature",
+    "set_mesh_feature_selection",
+    "set_mesh_automatic",
+    "set_mesh_feature_active",
+    "set_geometry_feature_selection",
+    "create_study",
+    "create_frequency_domain_step",
+    "set_study_frequency",
     "set_parameters",
     "ensure_component",
     "ensure_geometry",

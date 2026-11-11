@@ -15,9 +15,10 @@ from comsol_mcp._state import (
     _friendly_connection_error,
 )
 from comsol_mcp._connection import (
-    _disconnect_locked, _ensure_client_shell, _timed_call,
+    _disconnect_locked, _ensure_client_shell,
 )
 from comsol_mcp._model import _set_current_model, _adopt_model_by_name
+from comsol_mcp._dispatch import checkpoint, connection_entry
 
 
 def server_info() -> str:
@@ -39,11 +40,8 @@ def server_info() -> str:
         loaded_model_count = 0
         if mph_ok and _srv._client is not None and _srv._client_connected:
             try:
-                loaded_model_count = _timed_call(
-                    lambda: len(list(_srv._client.models())),
-                    timeout=3.0,
-                    error_msg="Model enumeration timed out",
-                )
+                checkpoint("models")
+                loaded_model_count = len(list(_srv._client.models()))
             except Exception:
                 loaded_model_count = -1
 
@@ -107,6 +105,7 @@ def check_server_port(host: str = _srv.DEFAULT_HOST, port: int = _srv.DEFAULT_PO
     return _run_tool_readonly("check_server_port", _impl)
 
 
+@connection_entry
 def server_start(
     port: int = 0,
     cores: int = 0,
@@ -140,12 +139,15 @@ def server_start(
             timeout=max(5, int(timeout_seconds)),
         )
         _srv._server_started_by_mcp = True
-        client = _ensure_client_shell()
-        _timed_call(
-            client.connect, _srv._server.port, _srv.DEFAULT_HOST,
-            timeout=60.0,
-            error_msg=f"Connect to MCP-started server {_srv.DEFAULT_HOST}:{_srv._server.port} timed out.",
-        )
+        client = _ensure_client_shell(effective_version)
+        checkpoint("connect")
+        _srv._client_connection_uncertain = True
+        client.connect(_srv._server.port, _srv.DEFAULT_HOST)
+        checkpoint("connected")
+        _srv._client_connected = True
+        _srv._client_connection_uncertain = False
+        _srv._connected_host = _srv.DEFAULT_HOST
+        _srv._connected_port = _srv._server.port
         _write_status()
         return {
             "started_by_mcp": True,
@@ -166,19 +168,25 @@ def server_start(
     return _run_tool("server_start", _impl)
 
 
+@connection_entry
 def server_connect(host: str = _srv.DEFAULT_HOST, port: int = _srv.DEFAULT_PORT, model_name: str = "", timeout_seconds: float = 30.0) -> str:
     """Default entrypoint: attach MCP to an already running COMSOL Multiphysics Server.
 
     This is the recommended tool for the visible Desktop workflow:
     manually start COMSOL Multiphysics Server, call server_connect(host, port),
     load_visible_main_model(path), then connect Desktop and import that model.
+
+    timeout_seconds covers the entire operation, including queue/lock wait,
+    import, JVM initialization, connection and model enumeration. A timeout
+    stops waiting, not the underlying Java call; overlapping calls are rejected.
     """
 
     def _impl() -> dict[str, Any]:
+        checkpoint("import")
         _require_mph()
+        checkpoint("port")
         requested_host = host or _srv.DEFAULT_HOST
         requested_port = int(port)
-        effective_timeout = float(timeout_seconds) if float(timeout_seconds) > 0 else 30.0
 
         # Pre-check: TCP port probe before attempting the heavy mph connection
         if not _port_is_open(requested_host, requested_port, timeout_seconds=2.0):
@@ -207,27 +215,19 @@ def server_connect(host: str = _srv.DEFAULT_HOST, port: int = _srv.DEFAULT_PORT,
             _srv._server_started_by_mcp = False
         client = _ensure_client_shell()
         try:
-            _timed_call(
-                client.connect, requested_port, requested_host,
-                timeout=effective_timeout,
-                error_msg=(
-                    f"Connection to {requested_host}:{requested_port} timed out after {effective_timeout}s. "
-                    "Ensure COMSOL Multiphysics Server is running and the port is correct."
-                ),
-            )
-        except RuntimeError:
-            # Timeout or connection failure — discard the client so next
-            # attempt gets a fresh one rather than reusing a stale socket.
-            _srv._client = None
-            raise
+            checkpoint("connect")
+            _srv._client_connection_uncertain = True
+            client.connect(requested_port, requested_host)
+            checkpoint("connected")
         except Exception as exc:
-            _srv._client = None
-            _mark_awaiting_manual_server(requested_host, requested_port, "server_connect")
             raise _friendly_connection_error(exc, requested_host, requested_port) from exc
         _srv._client_connected = True
+        _srv._client_connection_uncertain = False
         _srv._connected_host = requested_host
         _srv._connected_port = requested_port
+        checkpoint("models")
         adopted = _adopt_model_by_name(model_name.strip())
+        checkpoint("adopt")
         if adopted is not None:
             _set_current_model(adopted, origin="connected")
         workflow = _read_workflow_state()
@@ -254,6 +254,7 @@ def server_connect(host: str = _srv.DEFAULT_HOST, port: int = _srv.DEFAULT_PORT,
     return _run_tool("server_connect", _impl)
 
 
+@connection_entry
 def server_disconnect(shutdown_server: bool = False) -> str:
     """Disconnect the MCP client. Optionally shut down the local server if MCP started it."""
 

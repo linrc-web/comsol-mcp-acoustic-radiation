@@ -40,7 +40,7 @@ class TestNormalizeProperties:
 
     def test_json_object(self):
         result = _normalize_properties('{"size": "0.1"}')
-        assert result == [("size", ["0.1"])]
+        assert result == [("size", "0.1")]
 
     def test_json_object_multi_value(self):
         result = _normalize_properties('{"size": ["0.1", "0.2"]}')
@@ -48,7 +48,7 @@ class TestNormalizeProperties:
 
     def test_json_array(self):
         result = _normalize_properties('[{"name": "pos", "value": "1"}]')
-        assert result == [("pos", ["1"])]
+        assert result == [("pos", "1")]
 
     def test_invalid_input(self):
         with pytest.raises(ValueError):

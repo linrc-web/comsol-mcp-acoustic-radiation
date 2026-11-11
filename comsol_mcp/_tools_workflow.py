@@ -242,11 +242,8 @@ def run_study(study_tag: str = "") -> str:
         model = _require_visible_main("run_study")
         study = study_tag.strip()
         if study:
-            try:
-                label = str(model.java.study().get(study).label())
-                model.solve(label)
-            except Exception:
-                model.solve(study)
+            label = str(model.java.study().get(study).label())
+            model.solve(label)
         else:
             model.solve()
         return {"study_tag": study, "label": _safe_model_label(model)}

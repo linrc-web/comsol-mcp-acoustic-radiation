@@ -16,6 +16,7 @@ from comsol_mcp._state import (
 )
 from comsol_mcp._model import _require_visible_main
 from comsol_mcp._solver_ops import (
+    _create_study, _create_frequency_domain_step, _set_study_frequency,
     _list_solver_configs, _list_solver_features,
     _create_solver_config, _configure_solver_feature,
     _list_segregated_steps, _add_segregated_step,
@@ -239,7 +240,43 @@ def run_study_status(job_id: str = "") -> str:
     })
 
 
+def create_study(study_tag: str) -> str:
+    """Create a study without generating solvers or solving; existing studies are preserved."""
+    def _impl() -> dict[str, Any]:
+        model = _require_visible_main("create_study")
+        tag = study_tag.strip()
+        if not tag:
+            raise ValueError("study_tag is required.")
+        return _create_study(model, tag)
+    return _run_tool("create_study", _impl)
+
+
+def create_frequency_domain_step(study_tag: str, step_tag: str) -> str:
+    """Add a Frequency step to an existing study; preserve existing Frequency steps."""
+    def _impl() -> dict[str, Any]:
+        model = _require_visible_main("create_frequency_domain_step")
+        study, step = study_tag.strip(), step_tag.strip()
+        if not study or not step:
+            raise ValueError("study_tag and step_tag are required.")
+        return _create_frequency_domain_step(model, study, step)
+    return _run_tool("create_frequency_domain_step", _impl)
+
+
+def set_study_frequency(study_tag: str, step_tag: str, frequency: str) -> str:
+    """Set an existing Frequency step's plist expression, e.g. 200[kHz], without solving."""
+    def _impl() -> dict[str, Any]:
+        model = _require_visible_main("set_study_frequency")
+        study, step, expression = study_tag.strip(), step_tag.strip(), frequency.strip()
+        if not study or not step or not expression:
+            raise ValueError("study_tag, step_tag and frequency are required.")
+        return _set_study_frequency(model, study, step, expression)
+    return _run_tool("set_study_frequency", _impl)
+
+
 def register(mcp_instance) -> None:
+    mcp_instance.add_tool(create_study)
+    mcp_instance.add_tool(create_frequency_domain_step)
+    mcp_instance.add_tool(set_study_frequency)
     mcp_instance.add_tool(list_solver_config)
     mcp_instance.add_tool(create_solver_config)
     mcp_instance.add_tool(list_solver_features)
